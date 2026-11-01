@@ -14,19 +14,55 @@ class AdbError(Exception):
 
 
 _LAUNCHER_LINE = re.compile(r"^([A-Za-z0-9_.]+)/\S+$")
+_PROP_LINE = re.compile(r"^\[(.+?)\]: \[(.*)\]$")
+
+# Các trạng thái mà `adb devices` có thể trả về.
+_KNOWN_STATES = {
+    "device",
+    "offline",
+    "unauthorized",
+    "authorizing",
+    "connecting",
+    "recovery",
+    "sideload",
+    "bootloader",
+    "rescue",
+    "host",
+    "no_permissions",
+}
+_META_PREFIXES = ("model:", "product:", "device:", "transport_id:", "usb:")
 
 
 def parse_devices(output: str) -> list[DeviceInfo]:
     devices: list[DeviceInfo] = []
-    for line in output.splitlines():
+    for raw_line in output.splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("*") or line.startswith("List of devices"):
+            continue
         parts = line.split()
-        if len(parts) >= 2 and parts[0] != "List" and not parts[0].startswith("*"):
-            model = ""
-            for part in parts[2:]:
-                if part.startswith("model:"):
-                    model = part[len("model:") :].replace("_", " ")
-                    break
-            devices.append(DeviceInfo(parts[0], parts[1], model))
+        if len(parts) < 2:
+            continue
+
+        serial = parts[0]
+        if line[len(serial) :].lstrip().startswith("no permissions"):
+            state = "no_permissions"
+            extras = parts[3:]
+        else:
+            state = parts[1]
+            extras = parts[2:]
+
+        has_meta = any(part.startswith(_META_PREFIXES) for part in extras)
+        # Bỏ qua các dòng không phải thiết bị, ví dụ cảnh báo lệch phiên bản
+        # "adb server version (41) doesn't match this client (40)...".
+        if state not in _KNOWN_STATES and not has_meta:
+            continue
+
+        model = ""
+        for part in extras:
+            if part.startswith("model:"):
+                model = part[len("model:") :].replace("_", " ")
+                break
+        devices.append(DeviceInfo(serial, state, model))
     return devices
 
 
@@ -66,6 +102,16 @@ def parse_launcher_packages(output: str) -> set[str]:
     return packages
 
 
+def parse_props(output: str) -> dict[str, str]:
+    """Đọc kết quả `getprop` (dòng `[key]: [value]`)."""
+    props: dict[str, str] = {}
+    for line in output.splitlines():
+        match = _PROP_LINE.match(line.strip())
+        if match:
+            props[match.group(1)] = match.group(2).strip()
+    return props
+
+
 def _is_success(output: str) -> bool:
     return any(line.strip() == "Success" for line in output.splitlines())
 
@@ -88,6 +134,7 @@ class AdbClient:
             result = subprocess.run(
                 command,
                 capture_output=True,
+                stdin=subprocess.DEVNULL,
                 text=True,
                 encoding="utf-8",
                 errors="replace",
@@ -109,31 +156,45 @@ class AdbClient:
         return output
 
     def restart_server(self) -> None:
-        """Tắt rồi bật lại ADB server.
+        """Thử khởi động lại ADB server.
 
-        Việc này khiến điện thoại hiện lại hộp thoại "Cho phép gỡ lỗi USB?"
-        nếu máy tính chưa được cấp quyền.
+        Lỗi từ kill-server không ngăn việc thử start-server, vì server có thể
+        vốn đã dừng. Nếu start-server thất bại, thông tin lỗi được giữ lại
+        để ConnectionChecker có thể hiển thị cho người dùng.
         """
+        kill_error = ""
+
         try:
             self.run(["kill-server"], timeout=15)
-        except AdbError:
-            pass
-        self.run(["start-server"], timeout=30)
+        except AdbError as exc:
+            kill_error = str(exc)
+
+        try:
+            self.run(["start-server"], timeout=30)
+        except AdbError as exc:
+            if kill_error:
+                raise AdbError(
+                    f"Không thể dừng ADB server: {kill_error}\n"
+                    f"Không thể khởi động ADB server: {exc}"
+                ) from exc
+            raise
 
     def device_name(self, serial: str) -> str:
-        """Tên thân thiện của máy, ví dụ "Samsung Galaxy S21"."""
+        """Tên thân thiện của máy, ví dụ "Samsung Galaxy S21".
 
-        def prop(name: str) -> str:
-            try:
-                return self.run(
-                    ["shell", "getprop", name], device=serial, timeout=10
-                ).strip()
-            except AdbError:
-                return ""
+        Chỉ dùng một lệnh `getprop` thay vì nhiều lệnh riêng lẻ.
+        """
+        try:
+            output = self.run(["shell", "getprop"], device=serial, timeout=10)
+        except AdbError:
+            return ""
+        props = parse_props(output)
 
-        manufacturer = prop("ro.product.manufacturer")
-        market = prop("ro.product.marketname") or prop("ro.config.marketing_name")
-        name = market or prop("ro.product.model")
+        manufacturer = props.get("ro.product.manufacturer", "")
+        market = props.get("ro.product.marketname") or props.get(
+            "ro.config.marketing_name", ""
+        )
+        name = market or props.get("ro.product.model", "")
         if (
             name
             and manufacturer
@@ -151,6 +212,11 @@ class AdbClient:
                 device = replace(device, name=name)
             result.append(device)
         return result
+
+    def ready_serials(self) -> set[str]:
+        """Kiểm tra nhanh các máy đang sẵn sàng (không đọc tên máy)."""
+        output = self.run(["devices"], timeout=10)
+        return {d.serial for d in parse_devices(output) if d.state == "device"}
 
     def list_packages(self, serial: str, filters: list[str]) -> list[str]:
         output = self.run(
